@@ -1,4 +1,23 @@
 import { pool } from '../config/db.js';
+import { uploadBufferToR2, deleteObjectFromR2, getKeyFromUrl } from '../utils/r2.js';
+import slugify from 'slugify';
+import crypto from 'crypto';
+
+const makeUniqueSlug = async (base) => {
+  let slug = slugify(base, { lower: true, strict: true });
+  if (!slug) slug = `product-${crypto.randomBytes(4).toString('hex')}`;
+  let exists = await pool.query('SELECT id FROM products WHERE slug=$1', [slug]);
+  let suffix = 1;
+  while (exists.rows.length) {
+    const candidate = `${slug}-${suffix++}`;
+    exists = await pool.query('SELECT id FROM products WHERE slug=$1', [candidate]);
+    if (!exists.rows.length) {
+      slug = candidate;
+      break;
+    }
+  }
+  return slug;
+};
 
 /**
  * 🟢 Create Category or Subcategory (requires: create_categories)
@@ -112,5 +131,587 @@ export const deleteCategory = async (req, res) => {
   } catch (err) {
     console.error('❌ Delete Category Error:', err);
     res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const createProduct = async (req, res) => {
+  try {
+    const {
+        title, description, price, category_id, sub_category_id,
+        carats, gross_weight, design_code, purity, color
+        } = req.body;
+
+
+    if (!title || !price || !category_id) {
+      return res.status(400).json({ message: 'Title, price and category_id are required.' });
+    }
+
+    const slug = await makeUniqueSlug(title);
+
+    const files = req.files || [];
+    const uploadedUrls = [];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const key = `products/${slug}/${Date.now()}-${i}-${file.originalname.replace(/\s+/g,'_')}`;
+      const url = await uploadBufferToR2(key, file.buffer, file.mimetype);
+      uploadedUrls.push(url);
+    }
+
+    const main_image_url = uploadedUrls[0] || null;
+    const images = uploadedUrls;
+
+    const result = await pool.query(
+  `INSERT INTO products
+    (title, slug, description, price, category_id, sub_category_id, carats, gross_weight, design_code, purity, color, main_image_url, images, created_by)
+   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+   RETURNING *`,
+  [title, slug, description || null, price, category_id, sub_category_id || null,
+   carats || null, gross_weight || null, design_code || null, purity || null, color || null,
+   main_image_url, images, req.user?.id || null]
+);
+
+    res.status(201).json({ message: 'Product created.', product: result.rows[0] });
+  } catch (err) {
+    console.error('Create Product Error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const getProductBySlug = async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const result = await pool.query('SELECT * FROM products WHERE slug=$1', [slug]);
+    if (!result.rows.length) return res.status(404).json({ message: 'Product not found.' });
+    const product = result.rows[0];
+    res.status(200).json({ product });
+  } catch (err) {
+    console.error('Get Product Error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const listProducts = async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page || '1', 10));
+    const limit = Math.min(100, parseInt(req.query.limit || '12', 10));
+    const offset = (page - 1) * limit;
+    const sort = req.query.sort === 'price_desc' ? 'price DESC' : (req.query.sort === 'price_asc' ? 'price ASC' : 'created_at DESC');
+
+    const q = req.query.q ? `%${req.query.q.trim().toLowerCase()}%` : null;
+    const category = req.query.category || null;
+
+    const conditions = [];
+    const values = [];
+    let idx = 1;
+
+    if (q) {
+      conditions.push(`(LOWER(p.title) LIKE $${idx} OR LOWER(p.description) LIKE $${idx})`);
+      values.push(q); idx++;
+    }
+
+    if (category) {
+      conditions.push(`(c.slug = $${idx} OR c.name ILIKE $${idx})`);
+      values.push(category); idx++;
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countQuery = `
+      SELECT COUNT(*)::INT as total
+      FROM products p
+      LEFT JOIN categories c ON c.id = p.category_id
+      ${whereClause}
+    `;
+    const countRes = await pool.query(countQuery, values);
+    const total = countRes.rows[0].total;
+
+    const dataQuery = `
+      SELECT p.*, c.name AS category_name, c.slug as category_slug
+      FROM products p
+      LEFT JOIN categories c ON c.id = p.category_id
+      ${whereClause}
+      ORDER BY ${sort}
+      LIMIT $${idx} OFFSET $${idx+1}
+    `;
+    values.push(limit, offset);
+
+    const dataRes = await pool.query(dataQuery, values);
+    res.status(200).json({
+      total,
+      page,
+      limit,
+      products: dataRes.rows
+    });
+  } catch (err) {
+    console.error('List Products Error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const updateProduct = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const payload = req.body;
+
+    const existing = await pool.query('SELECT * FROM products WHERE id=$1', [id]);
+    if (!existing.rows.length) return res.status(404).json({ message: 'Product not found.' });
+    const product = existing.rows[0];
+
+    const files = req.files || [];
+    const uploadedUrls = [];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const key = `products/${product.slug}/${Date.now()}-${i}-${file.originalname.replace(/\s+/g,'_')}`;
+      const url = await uploadBufferToR2(key, file.buffer, file.mimetype);
+      uploadedUrls.push(url);
+    }
+
+    let images = product.images || [];
+    if (uploadedUrls.length) images = [...uploadedUrls, ...images];
+
+    const main_image_url = payload.main_image_url || images[0] || product.main_image_url;
+
+    const updateQuery = `
+      UPDATE products SET
+        title = COALESCE($1, title),
+        description = COALESCE($2, description),
+        price = COALESCE($3, price),
+        category_id = COALESCE($4, category_id),
+        sub_category_id = COALESCE($5, sub_category_id),
+        carats = COALESCE($6, carats),
+        gross_weight = COALESCE($7, gross_weight),
+        design_code = COALESCE($8, design_code),
+        purity = COALESCE($9, purity),
+        color = COALESCE($10, color),
+        main_image_url = $11,
+        images = $12,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id=$13
+      RETURNING *`;
+    const values = [
+      payload.title || null,
+      payload.description || null,
+      payload.price || null,
+      payload.category_id || null,
+      payload.sub_category_id || null,
+      payload.carats || null,
+      payload.gross_weight || null,
+      payload.design_code || null,
+      payload.purity || null,
+      payload.color || null,
+      main_image_url,
+      images,
+      id
+    ];
+
+    const updated = await pool.query(updateQuery, values);
+    res.status(200).json({ message: 'Product updated.', product: updated.rows[0] });
+  } catch (err) {
+    console.error('Update Product Error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const deleteProduct = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = await pool.query('SELECT * FROM products WHERE id=$1', [id]);
+    if (!existing.rows.length) return res.status(404).json({ message: 'Product not found.' });
+
+    const product = existing.rows[0];
+    const images = product.images || [];
+
+    for (const url of images) {
+      const key = getKeyFromUrl(url);
+      if (key) {
+        try { await deleteObjectFromR2(key); } catch (e) { console.warn('Failed delete:', key, e.message); }
+      }
+    }
+    await pool.query('DELETE FROM products WHERE id=$1', [id]);
+
+    res.status(200).json({ message: 'Product deleted and images removed.' });
+  } catch (err) {
+    console.error('Delete Product Error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+
+
+
+
+export const addToWishlist = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { product_id } = req.body;
+    if (!product_id) return res.status(400).json({ message: 'product_id is required.' });
+
+    await pool.query('BEGIN');
+
+    // create wishlist row (ignore duplicate)
+    await pool.query(
+      `INSERT INTO wishlists (user_id, product_id) VALUES ($1,$2)
+       ON CONFLICT (user_id, product_id) DO NOTHING`,
+      [userId, product_id]
+    );
+
+    // increment wishlist counter only if newly inserted
+    const inserted = (await pool.query(
+      `SELECT 1 FROM wishlists WHERE user_id=$1 AND product_id=$2`,
+      [userId, product_id]
+    )).rows.length;
+
+    // To avoid race, increment unconditionally using GREATEST check is insufficient to decide new insertion.
+    // Simpler: try to increment only when the row didn't exist before the INSERT.
+    // We'll check count of rows for that user/product before insert — but here we already inserted.
+    // Safer approach: use RETURNING in insert — but ON CONFLICT DO NOTHING returns no row if conflict.
+    // Instead: attempt increment only when we inserted => check if there is more than 0 and also whether wishlist_count changed.
+    // We'll run a conditional increment using a separate query that increments if there is at least one wishlist row and product.wishlist_count < current_count+1 is hard.
+    // Simpler pragmatic approach: increment using an UPSERT into a helper table is complex. We'll attempt to increment using a cheap select check for existence BEFORE the insert.
+
+    // To do this robustly, let's re-implement with pre-check:
+    await pool.query('ROLLBACK'); // rollback current transaction and redo properly below
+
+    await pool.query('BEGIN');
+    const before = (await pool.query('SELECT 1 FROM wishlists WHERE user_id=$1 AND product_id=$2', [userId, product_id])).rows.length;
+    if (before === 0) {
+      // insert then increment
+      await pool.query('INSERT INTO wishlists (user_id, product_id) VALUES ($1,$2)', [userId, product_id]);
+      await pool.query('UPDATE products SET wishlist_count = wishlist_count + 1 WHERE id=$1', [product_id]);
+      await pool.query(
+        `INSERT INTO product_events (product_id, event_type, meta) VALUES ($1, 'wishlist_add', $2)`,
+        [product_id, JSON.stringify({ user_id: userId })]
+      );
+    }
+
+    await pool.query('COMMIT');
+    return res.status(200).json({ message: 'Added to wishlist.' });
+  } catch (err) {
+    console.error('Add to wishlist error:', err);
+    await pool.query('ROLLBACK').catch(()=>{});
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const removeFromWishlist = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { product_id } = req.body;
+    if (!product_id) return res.status(400).json({ message: 'product_id is required.' });
+
+    await pool.query('BEGIN');
+
+    const existed = (await pool.query('SELECT id FROM wishlists WHERE user_id=$1 AND product_id=$2', [userId, product_id])).rows.length;
+    if (!existed) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ message: 'Wishlist item not found.' });
+    }
+
+    await pool.query('DELETE FROM wishlists WHERE user_id=$1 AND product_id=$2', [userId, product_id]);
+    await pool.query('UPDATE products SET wishlist_count = GREATEST(wishlist_count - 1, 0) WHERE id=$1', [product_id]);
+    await pool.query(
+      `INSERT INTO product_events (product_id, event_type, meta) VALUES ($1, 'wishlist_remove', $2)`,
+      [product_id, JSON.stringify({ user_id: userId })]
+    );
+
+    await pool.query('COMMIT');
+    res.status(200).json({ message: 'Removed from wishlist.' });
+  } catch (err) {
+    console.error('Remove wishlist error:', err);
+    await pool.query('ROLLBACK').catch(()=>{});
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const getWishlist = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const rows = (await pool.query(`
+      SELECT p.*, w.created_at as added_at
+      FROM wishlists w
+      JOIN products p ON p.id = w.product_id
+      WHERE w.user_id = $1
+      ORDER BY w.created_at DESC
+    `, [userId])).rows;
+    res.status(200).json({ items: rows });
+  } catch (err) {
+    console.error('Get wishlist error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+// --------------- CART ----------------
+
+export const addToCart = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { product_id, quantity = 1 } = req.body;
+    if (!product_id || quantity <= 0) return res.status(400).json({ message: 'product_id and positive quantity required.' });
+
+    await pool.query('BEGIN');
+
+    // ensure cart exists
+    let cart = (await pool.query('SELECT id FROM carts WHERE user_id=$1', [userId])).rows[0];
+    if (!cart) {
+      const r = await pool.query('INSERT INTO carts (user_id) VALUES ($1) RETURNING *', [userId]);
+      cart = r.rows[0];
+    }
+
+    // upsert cart_items: increment quantity if exists else insert
+    await pool.query(`
+      INSERT INTO cart_items (cart_id, product_id, quantity)
+      VALUES ($1,$2,$3)
+      ON CONFLICT (cart_id, product_id) DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity, updated_at = CURRENT_TIMESTAMP
+    `, [cart.id, product_id, quantity]);
+
+    await pool.query(`INSERT INTO product_events (product_id, event_type, meta) VALUES ($1,'cart_add',$2)`, [product_id, JSON.stringify({ user_id: userId, quantity })]);
+
+    await pool.query('COMMIT');
+    res.status(200).json({ message: 'Added to cart.' });
+  } catch (err) {
+    console.error('Add to cart error:', err);
+    await pool.query('ROLLBACK').catch(()=>{});
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const updateCartItem = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { product_id, quantity } = req.body;
+    if (!product_id || !quantity || quantity <= 0) return res.status(400).json({ message: 'product_id and positive quantity required.' });
+
+    const cart = (await pool.query('SELECT id FROM carts WHERE user_id=$1', [userId])).rows[0];
+    if (!cart) return res.status(404).json({ message: 'Cart not found.' });
+
+    const result = await pool.query(`
+      UPDATE cart_items SET quantity=$1, updated_at=CURRENT_TIMESTAMP
+      WHERE cart_id=$2 AND product_id=$3 RETURNING *
+    `, [quantity, cart.id, product_id]);
+
+    if (!result.rows.length) return res.status(404).json({ message: 'Cart item not found.' });
+
+    await pool.query(`INSERT INTO product_events (product_id, event_type, meta) VALUES ($1,'cart_update',$2)`, [product_id, JSON.stringify({ user_id: userId, quantity })]);
+
+    res.status(200).json({ message: 'Cart item updated.', item: result.rows[0] });
+  } catch (err) {
+    console.error('Update cart error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const removeCartItem = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { product_id } = req.body;
+    if (!product_id) return res.status(400).json({ message: 'product_id is required.' });
+
+    const cart = (await pool.query('SELECT id FROM carts WHERE user_id=$1', [userId])).rows[0];
+    if (!cart) return res.status(404).json({ message: 'Cart not found.' });
+
+    const deleted = (await pool.query('DELETE FROM cart_items WHERE cart_id=$1 AND product_id=$2 RETURNING *', [cart.id, product_id])).rows[0];
+    if (!deleted) return res.status(404).json({ message: 'Cart item not found.' });
+
+    await pool.query(`INSERT INTO product_events (product_id, event_type, meta) VALUES ($1,'cart_remove',$2)`, [product_id, JSON.stringify({ user_id: userId })]);
+
+    res.status(200).json({ message: 'Cart item removed.' });
+  } catch (err) {
+    console.error('Remove cart item error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const getCart = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const cart = (await pool.query('SELECT id FROM carts WHERE user_id=$1', [userId])).rows[0];
+    if (!cart) return res.status(200).json({ items: [], total: 0 });
+
+    const items = (await pool.query(`
+      SELECT ci.id, ci.quantity, p.id as product_id, p.title, p.price, p.main_image_url
+      FROM cart_items ci
+      JOIN products p ON p.id = ci.product_id
+      WHERE ci.cart_id = $1
+    `, [cart.id])).rows;
+
+    // compute total
+    const total = items.reduce((s, it) => s + parseFloat(it.price) * it.quantity, 0);
+    res.status(200).json({ items, total });
+  } catch (err) {
+    console.error('Get cart error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+
+export const createOrderFromCart = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { metadata } = req.body;
+
+    await pool.query('BEGIN');
+
+    const cart = (await pool.query('SELECT id FROM carts WHERE user_id=$1', [userId])).rows[0];
+    if (!cart) {
+      await pool.query('ROLLBACK');
+      return res.status(400).json({ message: 'Cart is empty.' });
+    }
+
+    const items = (await pool.query(`
+      SELECT ci.product_id, ci.quantity, p.price
+      FROM cart_items ci
+      JOIN products p ON p.id = ci.product_id
+      WHERE ci.cart_id = $1
+    `, [cart.id])).rows;
+
+    if (!items.length) {
+      await pool.query('ROLLBACK');
+      return res.status(400).json({ message: 'Cart is empty.' });
+    }
+
+    let total = 0;
+    items.forEach(it => total += parseFloat(it.price) * it.quantity);
+
+    const orderRes = await pool.query(
+      `INSERT INTO orders (user_id, total, status, metadata) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [userId, total, 'pending', metadata ? JSON.stringify(metadata) : null]
+    );
+    const order = orderRes.rows[0];
+
+    // insert order items and increment sold_count and product_events
+    for (const it of items) {
+      const unitPrice = parseFloat(it.price);
+      const qty = parseInt(it.quantity, 10);
+      const t = unitPrice * qty;
+      await pool.query(`INSERT INTO order_items (order_id, product_id, unit_price, quantity, total) VALUES ($1,$2,$3,$4,$5)`, [order.id, it.product_id, unitPrice, qty, t]);
+
+      await pool.query('UPDATE products SET sold_count = COALESCE(sold_count,0) + $1 WHERE id=$2', [qty, it.product_id]);
+
+      // event
+      await pool.query(`INSERT INTO product_events (product_id, event_type, meta) VALUES ($1,'order_item',$2)`, [it.product_id, JSON.stringify({ user_id: userId, quantity: qty, order_id: order.id })]);
+    }
+
+    await pool.query('DELETE FROM cart_items WHERE cart_id=$1', [cart.id]);
+
+    await pool.query('COMMIT');
+    res.status(201).json({ message: 'Order created.', order_id: order.id });
+  } catch (err) {
+    console.error('Create order error:', err);
+    await pool.query('ROLLBACK').catch(()=>{});
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const getUserOrders = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const orders = (await pool.query('SELECT * FROM orders WHERE user_id=$1 ORDER BY created_at DESC', [userId])).rows;
+    res.status(200).json({ orders });
+  } catch (err) {
+    console.error('Get user orders error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const getOrderDetails = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+    const order = (await pool.query('SELECT * FROM orders WHERE id=$1 AND user_id=$2', [id, userId])).rows[0];
+    if (!order) return res.status(404).json({ message: 'Order not found.' });
+
+    const items = (await pool.query('SELECT * FROM order_items WHERE order_id=$1', [id])).rows;
+    res.status(200).json({ order, items });
+  } catch (err) {
+    console.error('Get order details error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const listAllOrders = async (req, res) => {
+  try {
+    const rows = (await pool.query('SELECT o.*, u.full_name, u.email FROM orders o LEFT JOIN users u ON u.id=o.user_id ORDER BY o.created_at DESC')).rows;
+    res.status(200).json({ orders: rows });
+  } catch (err) {
+    console.error('List all orders error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+
+export const recordProductView = async (req, res) => {
+  try {
+    const { product_id } = req.body;
+    if (!product_id) return res.status(400).json({ message: 'product_id required.' });
+
+    await pool.query('BEGIN');
+    await pool.query('UPDATE products SET views = COALESCE(views,0) + 1 WHERE id=$1', [product_id]);
+    await pool.query('INSERT INTO product_events (product_id, event_type, meta) VALUES ($1, \'view\', $2)', [product_id, JSON.stringify({ ip: req.ip, user_id: req.user?.id || null })]);
+    await pool.query('COMMIT');
+
+    res.status(200).json({ message: 'View recorded.' });
+  } catch (err) {
+    console.error('Record view error:', err);
+    await pool.query('ROLLBACK').catch(()=>{});
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const getUserDetails = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    if (!userId) return res.status(400).json({ message: 'Invalid user ID.' });
+
+    const userResult = await pool.query(
+      `SELECT id, full_name, email, role, created_at FROM users WHERE id=$1`,
+      [userId]
+    );
+    const user = userResult.rows[0];
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const cartResult = await pool.query(
+      `SELECT COUNT(*) AS total_items, COALESCE(SUM(quantity), 0) AS total_quantity
+       FROM cart WHERE user_id=$1`,
+      [userId]
+    );
+
+    const wishlistResult = await pool.query(
+      `SELECT COUNT(*) AS total_items FROM wishlist WHERE user_id=$1`,
+      [userId]
+    );
+
+    const recentViews = await pool.query(
+      `SELECT p.id, p.title, p.slug, p.main_image_url, p.price, e.created_at AS viewed_at
+       FROM product_events e
+       JOIN products p ON e.product_id = p.id
+       WHERE e.user_id=$1 AND e.event_type='view'
+       ORDER BY e.created_at DESC
+       LIMIT 5`,
+      [userId]
+    );
+
+    const totalOrders = await pool.query(
+      `SELECT COUNT(*) AS orders_count FROM product_events WHERE user_id=$1 AND event_type='order'`,
+      [userId]
+    );
+
+    res.status(200).json({
+      message: 'User details fetched successfully',
+      user,
+      cart: {
+        total_items: parseInt(cartResult.rows[0].total_items || 0),
+        total_quantity: parseInt(cartResult.rows[0].total_quantity || 0),
+      },
+      wishlist: {
+        total_items: parseInt(wishlistResult.rows[0].total_items || 0),
+      },
+      analytics: {
+        total_orders: parseInt(totalOrders.rows[0].orders_count || 0),
+        recent_views: recentViews.rows,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Error fetching user details:', error);
+    res.status(500).json({ message: 'Internal server error' });
   }
 };

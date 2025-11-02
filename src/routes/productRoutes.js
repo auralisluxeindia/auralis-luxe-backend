@@ -1,13 +1,22 @@
 import express from 'express';
+import multer from 'multer';
 import {
   createCategory,
   getCategories,
   updateCategory,
-  deleteCategory
+  deleteCategory,
+
+  createProduct,
+  listProducts,
+  getProductBySlug,
+  updateProduct,
+  deleteProduct,
+  getUserDetails
 } from '../controllers/productController.js';
-import { authenticate, authorizePermission } from '../middlewares/authMiddleware.js';
+import { authenticate, authorizePermission } from '../middlewares/authMiddleware.js'; 
 
 const router = express.Router();
+const upload = multer();
 
 router.get('/available-categories', getCategories);
 
@@ -31,5 +40,34 @@ router.delete(
   authorizePermission('delete_categories'),
   deleteCategory
 );
+
+
+router.get('/', listProducts); // query: ?page=1&limit=12&sort=price_asc&q=ring&category=necklaces
+router.get('/:slug', getProductBySlug);
+
+router.post(
+  '/',
+  authenticate,
+  authorizePermission('create_products'),
+  upload.array('images', 8),
+  createProduct
+);
+
+router.put(
+  '/:id',
+  authenticate,
+  authorizePermission('edit_products'),
+  upload.array('images', 8),
+  updateProduct
+);
+
+router.delete(
+  '/:id',
+  authenticate,
+  authorizePermission('delete_products'),
+  deleteProduct
+);
+
+router.get('/user-details', authenticate, getUserDetails);
 
 export default router;
