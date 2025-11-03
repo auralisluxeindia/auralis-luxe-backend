@@ -242,69 +242,90 @@ export const getProductBySlug = async (req, res) => {
 };
 
 export const listProducts = async (req, res) => {
-  try {
-    const page = Math.max(1, parseInt(req.query.page || '1', 10));
-    const limit = Math.min(100, parseInt(req.query.limit || '12', 10));
-    const offset = (page - 1) * limit;
-    const sort = req.query.sort === 'price_desc' ? 'price DESC' : (req.query.sort === 'price_asc' ? 'price ASC' : 'created_at DESC');
 
-    const q = req.query.q ? `%${req.query.q.trim().toLowerCase()}%` : null;
-    const category = req.query.category || null;
+  try {
+    const page = Math.max(1, parseInt(req.query.page ?? '1', 10));
+    const limit = Math.min(100, parseInt(req.query.limit ?? '12', 10));
+    const offset = (page - 1) * limit;
+
+
+    const sortOptions = {
+      price_desc: 'p.price DESC',
+      price_asc: 'p.price ASC',
+      newest: 'p.created_at DESC',
+      popular: 'COALESCE(p.views, 0) DESC',
+    };
+    const sort = sortOptions[req.query.sort] || sortOptions.newest;
+
+    const q = req.query.q?.trim().toLowerCase() || null;
+    const category = req.query.category?.trim().toLowerCase() || null;
+
 
     const conditions = [];
     const values = [];
     let idx = 1;
 
     if (q) {
-      conditions.push(`(LOWER(p.title) LIKE $${idx} OR LOWER(p.description) LIKE $${idx})`);
-      values.push(q); idx++;
+      values.push(`%${q}%`);
+      idx++;
     }
 
-    if (category) {
-      conditions.push(`(c.slug = $${idx} OR c.name ILIKE $${idx})`);
-      values.push(category); idx++;
-    }
+  if (category && category !== 'search-results') {
+  conditions.push(`(LOWER(c.slug) = LOWER($${idx}) OR LOWER(c.name) = LOWER($${idx}))`);
+  values.push(category);
+  idx++;
+}
+
 
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-
+    
     const countQuery = `
-      SELECT COUNT(*)::INT as total
+      SELECT COUNT(*)::INT AS total
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
       ${whereClause}
     `;
+
+
     const countRes = await pool.query(countQuery, values);
-    const total = countRes.rows[0].total;
+    const total = countRes.rows[0]?.total ?? 0;
+
+    console.log('📊 Total Products Found:', total);
 
     const dataQuery = `
-  SELECT 
-    p.*, 
-    c.name AS category_name, 
-    c.slug AS category_slug,
-    sc.name AS sub_category_name,
-    sc.slug AS sub_category_slug
-  FROM products p
-  LEFT JOIN categories c ON c.id = p.category_id
-  LEFT JOIN categories sc ON sc.id = p.sub_category_id
-  ${whereClause}
-  ORDER BY ${sort}
-  LIMIT $${idx} OFFSET $${idx + 1}
-`;
+      SELECT 
+        p.id, p.title, p.price, p.images, p.description,
+        p.carats, p.gross_weight, p.views,
+        c.name AS category_name, c.slug AS category_slug,
+        sc.name AS sub_category_name, sc.slug AS sub_category_slug
+      FROM products p
+      LEFT JOIN categories c ON c.id = p.category_id
+      LEFT JOIN categories sc ON sc.id = p.sub_category_id
+      ${whereClause}
+      ORDER BY ${sort}
+      LIMIT $${idx} OFFSET $${idx + 1}
+    `;
 
     values.push(limit, offset);
 
+    
     const dataRes = await pool.query(dataQuery, values);
+
+
     res.status(200).json({
       total,
       page,
       limit,
-      products: dataRes.rows
+      products: dataRes.rows,
     });
+
   } catch (err) {
-    console.error('List Products Error:', err);
+    console.error('🔥 [listProducts] Error:', err);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
+
+
 
 export const searchProducts = async (req, res) => {
   try {
@@ -768,26 +789,81 @@ export const listAllOrders = async (req, res) => {
 export const recordProductView = async (req, res) => {
   try {
     const { product_id } = req.body;
-    if (!product_id) return res.status(400).json({ message: 'product_id required.' });
+    if (!product_id) {
+      return res.status(400).json({ message: 'product_id required.' });
+    }
+
+    const check = await pool.query('SELECT id FROM products WHERE id = $1', [product_id]);
+    if (check.rowCount === 0) {
+      return res.status(200).json({ message: 'Product not found, skipping view record.' });
+    }
 
     await pool.query('BEGIN');
-    await pool.query('UPDATE products SET views = COALESCE(views,0) + 1 WHERE id=$1', [product_id]);
-    await pool.query('INSERT INTO product_events (product_id, event_type, meta) VALUES ($1, \'view\', $2)', [product_id, JSON.stringify({ ip: req.ip, user_id: req.user?.id || null })]);
+
+    // ✅ Safe view increment
+    await pool.query('UPDATE products SET views = COALESCE(views, 0) + 1 WHERE id = $1', [product_id]);
+
+    // ✅ Log the event
+    await pool.query(
+      `INSERT INTO product_events (product_id, event_type, meta)
+       VALUES ($1, 'view', $2)`,
+      [product_id, JSON.stringify({ ip: req.ip, user_id: req.user?.id || null })]
+    );
+
     await pool.query('COMMIT');
 
-    res.status(200).json({ message: 'View recorded.' });
+    res.status(200).json({ message: 'View recorded successfully.' });
   } catch (err) {
     console.error('Record view error:', err);
-    await pool.query('ROLLBACK').catch(()=>{});
+    await pool.query('ROLLBACK').catch(() => {});
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
+
+export const getTrendingProducts = async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 12;
+
+    const trendingQuery = `
+      (
+        SELECT id, title, price, images, category_id, sub_category_id, carats, gross_weight, views
+        FROM products
+        WHERE COALESCE(views, 0) > 0
+        ORDER BY views DESC
+        LIMIT $1
+      )
+      UNION ALL
+      (
+        SELECT id, title, price, images, category_id, sub_category_id, carats, gross_weight, views
+        FROM products
+        WHERE COALESCE(views, 0) = 0
+        ORDER BY id DESC
+        LIMIT $1
+      )
+      LIMIT $1
+    `;
+
+    const result = await pool.query(trendingQuery, [limit]);
+
+    if (result.rows.length === 0) {
+      return res.status(200).json({ items: [] });
+    }
+
+    return res.status(200).json({ items: result.rows });
+  } catch (err) {
+    console.error('Error fetching trending products:', err);
+    return res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+
+
+
 export const getUserDetails = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user?.id;
     if (!userId) return res.status(400).json({ message: 'Invalid user ID.' });
-
     const userResult = await pool.query(
       `SELECT id, full_name, email, role, created_at FROM users WHERE id=$1`,
       [userId]
@@ -795,54 +871,93 @@ export const getUserDetails = async (req, res) => {
     const user = userResult.rows[0];
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const cartResult = await pool.query(
-      `SELECT COUNT(*) AS total_items, COALESCE(SUM(quantity), 0) AS total_quantity
-       FROM cart WHERE user_id=$1`,
-      [userId]
-    );
-
-    const wishlistResult = await pool.query(
-      `SELECT COUNT(*) AS total_items FROM wishlist WHERE user_id=$1`,
-      [userId]
-    );
-
-    const recentViews = await pool.query(
-      `SELECT p.id, p.title, p.slug, p.main_image_url, p.price, e.created_at AS viewed_at
-       FROM product_events e
-       JOIN products p ON e.product_id = p.id
-       WHERE e.user_id=$1 AND e.event_type='view'
-       ORDER BY e.created_at DESC
-       LIMIT 5`,
-      [userId]
-    );
-
-    const totalOrders = await pool.query(
-      `SELECT COUNT(*) AS orders_count FROM product_events WHERE user_id=$1 AND event_type='order'`,
-      [userId]
-    );
-
+    let profile = {};
+    try {
+      const profileResult = await pool.query(
+        `SELECT phone, address FROM user_profiles WHERE user_id=$1`,
+        [userId]
+      );
+      profile = profileResult.rows[0] || {};
+    } catch {
+      profile = {};
+    }
+    let cart = { total_items: 0, total_quantity: 0 };
+    try {
+      const cartResult = await pool.query(
+        `SELECT COUNT(*) AS total_items, COALESCE(SUM(ci.quantity), 0) AS total_quantity
+         FROM carts c
+         LEFT JOIN cart_items ci ON ci.cart_id = c.id
+         WHERE c.user_id=$1`,
+        [userId]
+      );
+      cart = {
+        total_items: parseInt(cartResult.rows[0]?.total_items || 0),
+        total_quantity: parseInt(cartResult.rows[0]?.total_quantity || 0),
+      };
+    } catch {
+      cart = { total_items: 0, total_quantity: 0 };
+    }
+    let wishlistCount = 0;
+    try {
+      const wishlistResult = await pool.query(
+        `SELECT COUNT(*) AS total_items FROM wishlists WHERE user_id=$1`,
+        [userId]
+      );
+      wishlistCount = parseInt(wishlistResult.rows[0]?.total_items || 0);
+    } catch {
+      wishlistCount = 0;
+    }
     res.status(200).json({
       message: 'User details fetched successfully',
-      user,
-      cart: {
-        total_items: parseInt(cartResult.rows[0].total_items || 0),
-        total_quantity: parseInt(cartResult.rows[0].total_quantity || 0),
+      user: {
+        id: user.id,
+        full_name: user.full_name,
+        email: user.email,
+        phone: profile.phone || null,
+        address: profile.address || null,
       },
-      wishlist: {
-        total_items: parseInt(wishlistResult.rows[0].total_items || 0),
-      },
-      analytics: {
-        total_orders: parseInt(totalOrders.rows[0].orders_count || 0),
-        recent_views: recentViews.rows,
-      },
+      cart,
+      wishlist: { total_items: wishlistCount },
     });
+
   } catch (error) {
     console.error('Error fetching user details:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
-
-  
 };
+
+
+
+export const updateUserProfile = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const { full_name, phone, address } = req.body;
+
+    if (!userId) return res.status(400).json({ message: 'Invalid user ID.' });
+    if (full_name) {
+      await pool.query(`UPDATE users SET full_name=$1 WHERE id=$2`, [full_name, userId]);
+    }
+    try {
+      await pool.query(
+        `INSERT INTO user_profiles (user_id, phone, address)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id)
+         DO UPDATE SET 
+           phone = EXCLUDED.phone,
+           address = EXCLUDED.address`,
+        [userId, phone || null, address || null]
+      );
+    } catch (err) {
+      console.warn('⚠️ user_profiles table missing or not ready:', err.message);
+    }
+
+    res.status(200).json({ message: 'Profile updated successfully.' });
+  } catch (error) {
+    console.error('❌ Error updating profile:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
 
 export const bulkUploadProducts = async (req, res) => {
   try {
@@ -981,3 +1096,86 @@ export const bulkUploadProducts = async (req, res) => {
     res.status(500).json({ message: "Internal server error." });
   }
 };
+
+export const generateProductReport = async (req, res) => {
+  try {
+    const { productIds } = req.body;
+    if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
+      return res.status(400).json({ message: "productIds must be a non-empty array" });
+    }
+
+    const { rows: products } = await pool.query(
+      `
+      SELECT 
+        p.id,
+        p.name,
+        p.slug,
+        p.description,
+        p.price,
+        p.discount_price,
+        p.stock,
+        c.name AS category_name,
+        COALESCE(w.wishlist_count, 0) AS wishlist_count,
+        COALESCE(v.total_views, 0) AS total_views,
+        p.created_at
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      LEFT JOIN (
+        SELECT product_id, COUNT(*) AS wishlist_count
+        FROM wishlists
+        GROUP BY product_id
+      ) w ON p.id = w.product_id
+      LEFT JOIN (
+        SELECT product_id, COUNT(*) AS total_views
+        FROM product_views
+        GROUP BY product_id
+      ) v ON p.id = v.product_id
+      WHERE p.id = ANY($1::int[])
+      ORDER BY p.id;
+      `,
+      [productIds]
+    );
+
+    if (products.length === 0) {
+      return res.status(404).json({ message: "No products found for given IDs" });
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Product Report");
+
+    worksheet.columns = [
+      { header: "ID", key: "id", width: 10 },
+      { header: "Name", key: "name", width: 30 },
+      { header: "Slug", key: "slug", width: 25 },
+      { header: "Category", key: "category_name", width: 20 },
+      { header: "Price", key: "price", width: 12 },
+      { header: "Discount Price", key: "discount_price", width: 15 },
+      { header: "Stock", key: "stock", width: 10 },
+      { header: "Wishlist Count", key: "wishlist_count", width: 15 },
+      { header: "Total Views", key: "total_views", width: 15 },
+      { header: "Created At", key: "created_at", width: 20 },
+    ];
+
+    products.forEach((p) => worksheet.addRow(p));
+
+    const header = worksheet.getRow(1);
+    header.font = { bold: true };
+    header.alignment = { horizontal: "center" };
+    const buffer = await workbook.xlsx.writeBuffer();
+
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=product-report-${Date.now()}.xlsx`
+    );
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+
+    return res.send(buffer);
+  } catch (error) {
+    console.error("Error generating product report:", error);
+    res.status(500).json({ message: "Internal server error" });
+  }
+};
+

@@ -66,6 +66,21 @@ const pendingAdminsTable = `
     );
   `;
 
+  const userProfileTable = `
+  CREATE TABLE IF NOT EXISTS user_profiles (
+    id SERIAL PRIMARY KEY,
+    user_id INT UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    phone VARCHAR(20),
+    address TEXT,
+    city VARCHAR(100),
+    state VARCHAR(100),
+    postal_code VARCHAR(20),
+    country VARCHAR(100),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`;
+
+
   try {
     await pool.query(userTable);
     await pool.query(pendingOtpTable);
@@ -73,6 +88,8 @@ const pendingAdminsTable = `
     await pool.query(pendingAdminsTable);
     await pool.query(adminPermissionsTable);
     await pool.query(adminProfileTable);
+    await pool.query(userProfileTable);
+
     console.log('✅ Tables ensured: users, pending_otps, reset_passwords');
   } catch (error) {
     console.error('❌ Error creating tables:', error);

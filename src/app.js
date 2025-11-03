@@ -6,6 +6,8 @@ import { createTables } from './models/userModel.js';
 import { createProductTables } from './models/productModel.js';
 import authRoutes from './routes/authRoutes.js';
 import productRoutes from './routes/productRoutes.js';
+import ecommerceRoutes from './routes/ecommerceRoutes.js';
+
 
 dotenv.config();
 
@@ -20,6 +22,7 @@ createProductTables();
 
 app.use('/api/auth', authRoutes);
 app.use('/api/products', productRoutes);
+app.use('/api/ecom', ecommerceRoutes);
 
 app.get('/', (req, res) => {
   res.json({
