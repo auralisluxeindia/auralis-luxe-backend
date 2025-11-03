@@ -243,56 +243,50 @@ export const getProductBySlug = async (req, res) => {
 };
 
 export const listProducts = async (req, res) => {
-
   try {
-    const page = Math.max(1, parseInt(req.query.page ?? '1', 10));
-    const limit = Math.min(100, parseInt(req.query.limit ?? '12', 10));
+    const page = Math.max(1, parseInt(req.query.page ?? "1", 10));
+    const limit = Math.min(100, parseInt(req.query.limit ?? "12", 10));
     const offset = (page - 1) * limit;
 
-
     const sortOptions = {
-      price_desc: 'p.price DESC',
-      price_asc: 'p.price ASC',
-      newest: 'p.created_at DESC',
-      popular: 'COALESCE(p.views, 0) DESC',
+      price_desc: "p.price DESC",
+      price_asc: "p.price ASC",
+      newest: "p.created_at DESC",
+      popular: "COALESCE(p.views, 0) DESC",
     };
     const sort = sortOptions[req.query.sort] || sortOptions.newest;
 
     const q = req.query.q?.trim().toLowerCase() || null;
     const category = req.query.category?.trim().toLowerCase() || null;
 
-
     const conditions = [];
     const values = [];
     let idx = 1;
-
     if (q) {
+      conditions.push(
+        `(LOWER(p.title) LIKE $${idx} OR LOWER(p.description) LIKE $${idx})`
+      );
       values.push(`%${q}%`);
       idx++;
     }
+    if (category && category !== "search-results") {
+      conditions.push(
+        `(LOWER(c.slug) = LOWER($${idx}) OR LOWER(c.name) = LOWER($${idx}))`
+      );
+      values.push(category);
+      idx++;
+    }
 
-  if (category && category !== 'search-results') {
-  conditions.push(`(LOWER(c.slug) = LOWER($${idx}) OR LOWER(c.name) = LOWER($${idx}))`);
-  values.push(category);
-  idx++;
-}
-
-
-    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-    
+    const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const countQuery = `
       SELECT COUNT(*)::INT AS total
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
-      ${whereClause}
+      ${whereClause};
     `;
-
 
     const countRes = await pool.query(countQuery, values);
     const total = countRes.rows[0]?.total ?? 0;
-
-    console.log('📊 Total Products Found:', total);
-
     const dataQuery = `
       SELECT 
         p.id, p.title, p.price, p.images, p.description,
@@ -304,14 +298,12 @@ export const listProducts = async (req, res) => {
       LEFT JOIN categories sc ON sc.id = p.sub_category_id
       ${whereClause}
       ORDER BY ${sort}
-      LIMIT $${idx} OFFSET $${idx + 1}
+      LIMIT $${idx} OFFSET $${idx + 1};
     `;
 
     values.push(limit, offset);
 
-    
     const dataRes = await pool.query(dataQuery, values);
-
 
     res.status(200).json({
       total,
@@ -319,12 +311,12 @@ export const listProducts = async (req, res) => {
       limit,
       products: dataRes.rows,
     });
-
   } catch (err) {
-    console.error('🔥 [listProducts] Error:', err);
-    res.status(500).json({ message: 'Internal server error.' });
+    console.error("🔥 [listProducts] Error:", err);
+    res.status(500).json({ message: "Internal server error." });
   }
 };
+
 
 
 
