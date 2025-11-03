@@ -13,12 +13,14 @@ import {
   deleteProduct,
   getUserDetails,
   uploadCategoryImage,
-  searchProducts
+  searchProducts,
+  bulkUploadProducts
 } from '../controllers/productController.js';
 import { authenticate, authorizePermission } from '../middlewares/authMiddleware.js'; 
 
 const router = express.Router();
-const upload = multer();
+const upload = multer({ storage: multer.memoryStorage() });
+
 
 router.get('/available-categories', getCategories);
 
@@ -74,5 +76,13 @@ router.delete(
 router.get('/search', searchProducts);
 
 router.get('/user-details', authenticate, getUserDetails);
+
+router.post(
+  "/bulk-upload",
+  authenticate,
+  authorizePermission("create_products"),
+  upload.single("file"),
+  bulkUploadProducts
+);
 
 export default router;

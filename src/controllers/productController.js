@@ -3,6 +3,7 @@ import { uploadBufferToR2, deleteObjectFromR2, getKeyFromUrl } from '../utils/r2
 import slugify from 'slugify';
 import crypto from 'crypto';
 import multer from "multer";
+import XLSX from "xlsx";
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -836,7 +837,147 @@ export const getUserDetails = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('❌ Error fetching user details:', error);
+    console.error('Error fetching user details:', error);
     res.status(500).json({ message: 'Internal server error' });
+  }
+
+  
+};
+
+export const bulkUploadProducts = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No Excel file uploaded." });
+    }
+
+    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+    const sheet = workbook.SheetNames[0];
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheet]);
+
+    const success = [];
+    const failed = [];
+
+    for (const [index, row] of rows.entries()) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        const title = row["Title"]?.trim();
+        const description = row["Description"] || null;
+        const price = parseFloat(row["Price"]) || null;
+        const categoryName = row["Category Name"]?.trim();
+        const subCategoryName = row["Sub Category Name"]?.trim();
+        const imageFiles = row["Image Files"]?.split(",").map(s => s.trim()) || [];
+        const carats = parseFloat(row["Carats"]) || null;
+        const grossWeight = parseFloat(row["Gross Weight"]) || null;
+        const designCode = row["Design Code"]?.trim() || null;
+        const purity = row["Purity"]?.trim() || null;
+        const color = row["Colour"]?.trim() || null;
+
+        if (!title || !price || !categoryName) {
+          failed.push({ row: index + 2, reason: "Missing title, price or category." });
+          await client.query("ROLLBACK");
+          client.release();
+          continue;
+        }
+        let categoryId;
+        const catRes = await client.query(
+          `SELECT id FROM categories WHERE LOWER(name)=LOWER($1) AND parent_id IS NULL`,
+          [categoryName]
+        );
+
+        if (catRes.rows.length > 0) {
+          categoryId = catRes.rows[0].id;
+        } else {
+          const slug = categoryName.toLowerCase().replace(/\s+/g, "-");
+          const newCat = await client.query(
+            `INSERT INTO categories (name, slug, parent_id)
+             VALUES ($1, $2, NULL)
+             RETURNING id`,
+            [categoryName, slug]
+          );
+          categoryId = newCat.rows[0].id;
+        }
+        let subCategoryId = null;
+        if (subCategoryName) {
+          const subRes = await client.query(
+            `SELECT id FROM categories WHERE LOWER(name)=LOWER($1) AND parent_id=$2`,
+            [subCategoryName, categoryId]
+          );
+
+          if (subRes.rows.length > 0) {
+            subCategoryId = subRes.rows[0].id;
+          } else {
+            const slug = subCategoryName.toLowerCase().replace(/\s+/g, "-");
+            const newSub = await client.query(
+              `INSERT INTO categories (name, slug, parent_id)
+               VALUES ($1, $2, $3)
+               RETURNING id`,
+              [subCategoryName, slug, categoryId]
+            );
+            subCategoryId = newSub.rows[0].id;
+          }
+        }
+        const uploadedUrls = [];
+        for (const img of imageFiles) {
+          if (!img) continue;
+          if (img.startsWith("http")) {
+            uploadedUrls.push(img);
+          } else if (req.filesMap?.[img]) {
+            const fileBuffer = req.filesMap[img].buffer;
+            const key = `products/${Date.now()}-${img}`;
+            const url = await uploadBufferToR2(key, fileBuffer, req.filesMap[img].mimetype);
+            uploadedUrls.push(url);
+          } else {
+            console.warn(`⚠️ Skipping missing image for ${title}: ${img}`);
+          }
+        }
+
+        const mainImage = uploadedUrls[0] || null;
+        const slug = await makeUniqueSlug(title);
+        const result = await client.query(
+          `INSERT INTO products 
+           (title, slug, description, price, category_id, sub_category_id, carats, gross_weight, design_code, purity, color, main_image_url, images)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+           RETURNING id`,
+          [
+            title,
+            slug,
+            description,
+            price,
+            categoryId,
+            subCategoryId,
+            carats,
+            grossWeight,
+            designCode,
+            purity,
+            color,
+            mainImage,
+            uploadedUrls,
+          ]
+        );
+
+        await client.query("COMMIT");
+        client.release();
+
+        success.push({ row: index + 2, product_id: result.rows[0].id });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        client.release();
+        console.error(`Row ${index + 2} failed:`, err.message);
+        failed.push({ row: index + 2, reason: err.message });
+      }
+    }
+
+    return res.status(200).json({
+      message: "Bulk upload completed.",
+      totalRows: rows.length,
+      successCount: success.length,
+      failedCount: failed.length,
+      failed,
+    });
+  } catch (err) {
+    console.error("Bulk Upload Error:", err);
+    res.status(500).json({ message: "Internal server error." });
   }
 };
