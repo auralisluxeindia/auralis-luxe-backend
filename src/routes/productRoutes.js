@@ -35,7 +35,7 @@ router.post(
   authenticate,
   authorizePermission("view_reports"),
   generateProductReport
-);
+); // Done
 router.put(
   '/edit-category/:id',
   authenticate,
