@@ -1100,6 +1100,7 @@ export const bulkUploadProducts = async (req, res) => {
 export const generateProductReport = async (req, res) => {
   try {
     const { productIds } = req.body;
+
     if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
       return res.status(400).json({ message: "productIds must be a non-empty array" });
     }
@@ -1108,28 +1109,17 @@ export const generateProductReport = async (req, res) => {
       `
       SELECT 
         p.id,
-        p.name,
+        p.title,
         p.slug,
         p.description,
         p.price,
-        p.discount_price,
-        p.stock,
+        p.views AS total_views,
+        p.wishlist_count,
+        p.sold_count,
         c.name AS category_name,
-        COALESCE(w.wishlist_count, 0) AS wishlist_count,
-        COALESCE(v.total_views, 0) AS total_views,
         p.created_at
       FROM products p
       LEFT JOIN categories c ON p.category_id = c.id
-      LEFT JOIN (
-        SELECT product_id, COUNT(*) AS wishlist_count
-        FROM wishlists
-        GROUP BY product_id
-      ) w ON p.id = w.product_id
-      LEFT JOIN (
-        SELECT product_id, COUNT(*) AS total_views
-        FROM product_views
-        GROUP BY product_id
-      ) v ON p.id = v.product_id
       WHERE p.id = ANY($1::int[])
       ORDER BY p.id;
       `,
@@ -1145,14 +1135,13 @@ export const generateProductReport = async (req, res) => {
 
     worksheet.columns = [
       { header: "ID", key: "id", width: 10 },
-      { header: "Name", key: "name", width: 30 },
+      { header: "Title", key: "title", width: 30 },
       { header: "Slug", key: "slug", width: 25 },
       { header: "Category", key: "category_name", width: 20 },
       { header: "Price", key: "price", width: 12 },
-      { header: "Discount Price", key: "discount_price", width: 15 },
-      { header: "Stock", key: "stock", width: 10 },
       { header: "Wishlist Count", key: "wishlist_count", width: 15 },
       { header: "Total Views", key: "total_views", width: 15 },
+      { header: "Sold Count", key: "sold_count", width: 15 },
       { header: "Created At", key: "created_at", width: 20 },
     ];
 
@@ -1161,6 +1150,7 @@ export const generateProductReport = async (req, res) => {
     const header = worksheet.getRow(1);
     header.font = { bold: true };
     header.alignment = { horizontal: "center" };
+
     const buffer = await workbook.xlsx.writeBuffer();
 
     res.setHeader(
@@ -1178,4 +1168,5 @@ export const generateProductReport = async (req, res) => {
     res.status(500).json({ message: "Internal server error" });
   }
 };
+
 

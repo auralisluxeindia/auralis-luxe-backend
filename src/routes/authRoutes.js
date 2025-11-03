@@ -16,6 +16,6 @@ router.post(
   inviteAdmin
 ); // Done
 router.post('/complete-admin-signup', completeAdminSignup); // Done
-router.get('/admin-list', authenticate, authorizeRole(['super_admin']), listAdmins);
-router.delete('/remove-admin/:id', authenticate, authorizeRole(['super_admin']), removeAdmin);
+router.get('/admin-list', authenticate, authorizeRole(['super_admin']), listAdmins); // Done
+router.delete('/remove-admin/:id', authenticate, authorizeRole(['super_admin']), removeAdmin); // Done
 export default router;
