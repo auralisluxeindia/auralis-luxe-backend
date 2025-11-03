@@ -4,7 +4,7 @@ dotenv.config();
 
 const { Pool } = pkg;
 
-const pool = new Pool({
+export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
     require: true,
@@ -13,9 +13,7 @@ const pool = new Pool({
 });
 
 pool.on('connect', () => console.log('✅ Connected to PostgreSQL'));
-pool.on('error', err => {
+pool.on('error', (err) => {
   console.error('❌ PostgreSQL connection error:', err);
   process.exit(1);
 });
-
-export default pool;
