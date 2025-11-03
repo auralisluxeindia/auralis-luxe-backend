@@ -5,6 +5,8 @@ dotenv.config();
 const endpoint = process.env.R2_ENDPOINT || `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
 const bucket = process.env.R2_BUCKET;
 
+const publicBase = "https://pub-499cd352d1a2490d86a3cbaf49bc7b04.r2.dev";
+
 const s3 = new S3Client({
   region: "auto",
   endpoint,
@@ -21,10 +23,11 @@ export const uploadBufferToR2 = async (key, buffer, contentType = "application/o
     Key: key,
     Body: buffer,
     ContentType: contentType,
-    ACL: "public-read",
   });
+
   await s3.send(cmd);
-  const url = `${endpoint}/${bucket}/${encodeURIComponent(key)}`;
+
+  const url = `${publicBase}/${encodeURIComponent(key)}`;
   return url;
 };
 

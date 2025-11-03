@@ -2,6 +2,9 @@ import { pool } from '../config/db.js';
 import { uploadBufferToR2, deleteObjectFromR2, getKeyFromUrl } from '../utils/r2.js';
 import slugify from 'slugify';
 import crypto from 'crypto';
+import multer from "multer";
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 const makeUniqueSlug = async (base) => {
   let slug = slugify(base, { lower: true, strict: true });
@@ -19,34 +22,77 @@ const makeUniqueSlug = async (base) => {
   return slug;
 };
 
+
+export const uploadCategoryImage = [
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ message: "No file uploaded." });
+
+      const file = req.file;
+      const key = `categories/${Date.now()}-${file.originalname}`;
+
+      const imageUrl = await uploadBufferToR2(key, file.buffer, file.mimetype);
+
+      res.status(200).json({
+        message: "Image uploaded successfully.",
+        image_url: imageUrl,
+      });
+    } catch (err) {
+      console.error("❌ Upload to R2 failed:", err);
+      res.status(500).json({ message: "Failed to upload image." });
+    }
+  },
+];
+
 /**
  * 🟢 Create Category or Subcategory (requires: create_categories)
  */
 export const createCategory = async (req, res) => {
+  const client = await pool.connect();
+
   try {
-    const { name, description, parent_id, image_url } = req.body;
-    if (!name) return res.status(400).json({ message: 'Category name is required.' });
+    const { name, description, parent_id, image_url, subcategories = [] } = req.body;
 
-    const existing = await pool.query(
-      `SELECT id FROM categories WHERE name=$1 AND parent_id IS NOT DISTINCT FROM $2`,
-      [name, parent_id || null]
-    );
-    if (existing.rows.length > 0)
-      return res.status(409).json({ message: 'Category already exists under this parent.' });
+    if (!name) return res.status(400).json({ message: "Category name is required." });
 
-    const result = await pool.query(
+    await client.query("BEGIN");
+
+    const mainCategoryRes = await client.query(
       `INSERT INTO categories (name, description, parent_id, image_url, created_by)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
       [name, description || null, parent_id || null, image_url || null, req.user?.id || null]
     );
 
-    res.status(201).json({ message: 'Category created successfully.', category: result.rows[0] });
+    const mainCategory = mainCategoryRes.rows[0];
+
+    if (Array.isArray(subcategories) && subcategories.length > 0) {
+      const insertPromises = subcategories.map((sub) =>
+        client.query(
+          `INSERT INTO categories (name, description, parent_id, image_url, created_by)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [sub, null, mainCategory.id, null, req.user?.id || null]
+        )
+      );
+      await Promise.all(insertPromises);
+    }
+
+    await client.query("COMMIT");
+
+    res.status(201).json({
+      message: "Category and subcategories created successfully.",
+      category: mainCategory,
+    });
   } catch (err) {
-    console.error('❌ Create Category Error:', err);
-    res.status(500).json({ message: 'Internal server error.' });
+    await client.query("ROLLBACK");
+    console.error("❌ Create Category Error:", err);
+    res.status(500).json({ message: "Internal server error." });
+  } finally {
+    client.release();
   }
 };
+
 
 /**
  * 🌍 Get All Categories (nested structure)
@@ -55,11 +101,11 @@ export const getCategories = async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT * FROM categories ORDER BY id ASC`);
     const map = {};
-    rows.forEach(cat => (map[cat.id] = { ...cat, subcategories: [] }));
+    rows.forEach((cat) => (map[cat.id] = { ...cat, subcategories: [] }));
 
     const rootCategories = [];
 
-    rows.forEach(cat => {
+    rows.forEach((cat) => {
       if (cat.parent_id) {
         map[cat.parent_id]?.subcategories.push(map[cat.id]);
       } else {
@@ -68,14 +114,15 @@ export const getCategories = async (req, res) => {
     });
 
     res.status(200).json({
-      message: 'Categories fetched successfully.',
-      categories: rootCategories
+      message: "Categories fetched successfully.",
+      categories: rootCategories,
     });
   } catch (err) {
-    console.error('❌ Get Categories Error:', err);
-    res.status(500).json({ message: 'Internal server error.' });
+    console.error("❌ Get Categories Error:", err);
+    res.status(500).json({ message: "Internal server error." });
   }
 };
+
 
 /**
  * ✏️ Update Category or Subcategory (requires: edit_categories)
@@ -85,8 +132,8 @@ export const updateCategory = async (req, res) => {
     const { id } = req.params;
     const { name, description, parent_id, image_url } = req.body;
 
-    const check = await pool.query('SELECT * FROM categories WHERE id=$1', [id]);
-    if (!check.rows.length) return res.status(404).json({ message: 'Category not found.' });
+    const check = await pool.query("SELECT * FROM categories WHERE id=$1", [id]);
+    if (!check.rows.length) return res.status(404).json({ message: "Category not found." });
 
     const result = await pool.query(
       `UPDATE categories
@@ -100,10 +147,13 @@ export const updateCategory = async (req, res) => {
       [name, description, parent_id, image_url, id]
     );
 
-    res.status(200).json({ message: 'Category updated successfully.', category: result.rows[0] });
+    res.status(200).json({
+      message: "Category updated successfully.",
+      category: result.rows[0],
+    });
   } catch (err) {
-    console.error('❌ Update Category Error:', err);
-    res.status(500).json({ message: 'Internal server error.' });
+    console.error("❌ Update Category Error:", err);
+    res.status(500).json({ message: "Internal server error." });
   }
 };
 
@@ -226,13 +276,20 @@ export const listProducts = async (req, res) => {
     const total = countRes.rows[0].total;
 
     const dataQuery = `
-      SELECT p.*, c.name AS category_name, c.slug as category_slug
-      FROM products p
-      LEFT JOIN categories c ON c.id = p.category_id
-      ${whereClause}
-      ORDER BY ${sort}
-      LIMIT $${idx} OFFSET $${idx+1}
-    `;
+  SELECT 
+    p.*, 
+    c.name AS category_name, 
+    c.slug AS category_slug,
+    sc.name AS sub_category_name,
+    sc.slug AS sub_category_slug
+  FROM products p
+  LEFT JOIN categories c ON c.id = p.category_id
+  LEFT JOIN categories sc ON sc.id = p.sub_category_id
+  ${whereClause}
+  ORDER BY ${sort}
+  LIMIT $${idx} OFFSET $${idx + 1}
+`;
+
     values.push(limit, offset);
 
     const dataRes = await pool.query(dataQuery, values);
@@ -244,6 +301,74 @@ export const listProducts = async (req, res) => {
     });
   } catch (err) {
     console.error('List Products Error:', err);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+};
+
+export const searchProducts = async (req, res) => {
+  try {
+    const query = req.query.q ? req.query.q.trim().toLowerCase() : '';
+    const page = Math.max(1, parseInt(req.query.page || '1', 10));
+    const limit = Math.min(100, parseInt(req.query.limit || '12', 10));
+    const offset = (page - 1) * limit;
+
+    if (!query) {
+      return res.status(400).json({ message: 'Search query is required.' });
+    }
+
+    // Using trigram similarity for flexible search
+    const sql = `
+      WITH matched AS (
+        SELECT 
+          p.*, 
+          c.name AS category_name, 
+          sc.name AS sub_category_name,
+          GREATEST(
+            similarity(LOWER(p.title), $1),
+            similarity(LOWER(c.name), $1),
+            similarity(LOWER(sc.name), $1)
+          ) AS score
+        FROM products p
+        LEFT JOIN categories c ON c.id = p.category_id
+        LEFT JOIN sub_categories sc ON sc.id = p.sub_category_id
+        WHERE 
+          LOWER(p.title) ILIKE '%' || $1 || '%'
+          OR LOWER(p.description) ILIKE '%' || $1 || '%'
+          OR LOWER(c.name) ILIKE '%' || $1 || '%'
+          OR LOWER(sc.name) ILIKE '%' || $1 || '%'
+        ORDER BY score DESC, p.created_at DESC
+        LIMIT $2 OFFSET $3
+      )
+      SELECT * FROM matched;
+    `;
+
+    const countSql = `
+      SELECT COUNT(*)::INT AS total
+      FROM products p
+      LEFT JOIN categories c ON c.id = p.category_id
+      LEFT JOIN sub_categories sc ON sc.id = p.sub_category_id
+      WHERE 
+        LOWER(p.title) ILIKE '%' || $1 || '%'
+        OR LOWER(p.description) ILIKE '%' || $1 || '%'
+        OR LOWER(c.name) ILIKE '%' || $1 || '%'
+        OR LOWER(sc.name) ILIKE '%' || $1 || '%';
+    `;
+
+    const [dataRes, countRes] = await Promise.all([
+      pool.query(sql, [query, limit, offset]),
+      pool.query(countSql, [query])
+    ]);
+
+    res.status(200).json({
+      total: countRes.rows[0].total,
+      page,
+      limit,
+      query,
+      products: dataRes.rows
+    });
+
+  } catch (err) {
+    console.error('Search Products Error:', err);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };

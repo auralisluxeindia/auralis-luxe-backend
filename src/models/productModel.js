@@ -2,20 +2,40 @@ import { pool } from "../config/db.js";
 
 export const createProductTables = async () => {
   const categoriesTable = `
-    CREATE TABLE IF NOT EXISTS categories (
-      id SERIAL PRIMARY KEY,
-      name VARCHAR(100) NOT NULL UNIQUE,
-      slug VARCHAR(255) UNIQUE,
-      description TEXT,
-      parent_id INT REFERENCES categories(id) ON DELETE SET NULL,
-      image_url TEXT,
-      created_by INT REFERENCES users(id) ON DELETE SET NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+  CREATE TABLE IF NOT EXISTS categories (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(255) UNIQUE,
+    description TEXT,
+    parent_id INT REFERENCES categories(id) ON DELETE SET NULL,
+    image_url TEXT,
+    created_by INT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unique_category_per_parent UNIQUE (name, parent_id)
+  );
 
-    CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON categories(parent_id);
-  `;
+  CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON categories(parent_id);
+`;
+
+  const fixCategoryConstraints = `
+  DO $$
+  BEGIN
+    -- Drop old unique constraint if it exists
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint WHERE conname = 'categories_name_key'
+    ) THEN
+      ALTER TABLE categories DROP CONSTRAINT categories_name_key;
+    END IF;
+
+    -- Add new scoped uniqueness (name + parent_id)
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint WHERE conname = 'unique_category_per_parent'
+    ) THEN
+      ALTER TABLE categories ADD CONSTRAINT unique_category_per_parent UNIQUE (name, parent_id);
+    END IF;
+  END $$;
+`;
 
   const productsTable = `
     CREATE TABLE IF NOT EXISTS products (
@@ -46,7 +66,7 @@ export const createProductTables = async () => {
     CREATE TABLE IF NOT EXISTS product_events (
       id SERIAL PRIMARY KEY,
       product_id INT REFERENCES products(id) ON DELETE CASCADE,
-      event_type VARCHAR(50) NOT NULL, -- view, wishlist_add, wishlist_remove, order_item, cart_add, cart_remove
+      event_type VARCHAR(50) NOT NULL, 
       meta JSONB,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -88,7 +108,7 @@ export const createProductTables = async () => {
       id SERIAL PRIMARY KEY,
       user_id INT NOT NULL REFERENCES users(id) ON DELETE SET NULL,
       total NUMERIC(12,2) NOT NULL DEFAULT 0,
-      status VARCHAR(30) NOT NULL DEFAULT 'pending', -- pending|paid|shipped|cancelled
+      status VARCHAR(30) NOT NULL DEFAULT 'pending',
       metadata JSONB,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -108,37 +128,31 @@ export const createProductTables = async () => {
   `;
 
   const indexes = [
-    `CREATE INDEX IF NOT EXISTS idx_products_title ON products USING gin (to_tsvector('english', coalesce(title,'')));`,
     `CREATE INDEX IF NOT EXISTS idx_products_created_at ON products (created_at);`,
+    `CREATE INDEX IF NOT EXISTS idx_products_category_id ON products (category_id);`,
+    `CREATE INDEX IF NOT EXISTS idx_products_sub_category_id ON products (sub_category_id);`,
+
+    `CREATE EXTENSION IF NOT EXISTS pg_trgm;`,
+    `CREATE INDEX IF NOT EXISTS idx_products_search 
+      ON products USING GIN ((LOWER(title) || ' ' || LOWER(description)) gin_trgm_ops);`,
+    `CREATE INDEX IF NOT EXISTS idx_categories_name 
+      ON categories USING GIN (LOWER(name) gin_trgm_ops);`,
+    `CREATE INDEX IF NOT EXISTS idx_categories_slug ON categories(slug);`,
+
     `DO $$
      BEGIN
-       -- Ensure slug column exists in categories
-       IF NOT EXISTS (
-         SELECT 1 FROM information_schema.columns 
-         WHERE table_name='categories' AND column_name='slug'
-       ) THEN
-         EXECUTE 'ALTER TABLE categories ADD COLUMN slug VARCHAR(255) UNIQUE';
-       END IF;
-
-       -- Ensure sub_category_id column exists in products
        IF NOT EXISTS (
          SELECT 1 FROM information_schema.columns 
          WHERE table_name='products' AND column_name='sub_category_id'
        ) THEN
          EXECUTE 'ALTER TABLE products ADD COLUMN sub_category_id INT REFERENCES categories(id) ON DELETE SET NULL';
        END IF;
-
-       -- Ensure slug index exists
-       IF NOT EXISTS (
-         SELECT 1 FROM pg_indexes WHERE indexname='idx_categories_slug'
-       ) THEN
-         EXECUTE 'CREATE INDEX idx_categories_slug ON categories (slug)';
-       END IF;
      END $$;`
   ];
 
   try {
     await pool.query(categoriesTable);
+    await pool.query(fixCategoryConstraints);
     await pool.query(productsTable);
     await pool.query(productEventsTable);
     await pool.query(wishlistsTable);
@@ -152,7 +166,7 @@ export const createProductTables = async () => {
     }
 
     console.log(
-      "✅ Tables ensured: categories, products, product_events, wishlists, carts, cart_items, orders, order_items"
+      "✅ Tables ensured with optimized GIN & trigram indexes for fast product search."
     );
   } catch (error) {
     console.error("❌ Error creating tables:", error);

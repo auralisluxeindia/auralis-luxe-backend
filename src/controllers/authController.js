@@ -62,7 +62,7 @@ export const signup = async (req, res) => {
         <div style="text-align:center; margin:28px 0;">
           <div style="
             display:inline-block;
-            background-color:#e4a1b2;
+            background-color:#91203d;
             color:#000;
             padding:14px 28px;
             border-radius:10px;
@@ -83,7 +83,7 @@ export const signup = async (req, res) => {
           <p style="margin:0;">Warm regards,</p>
           <p style="margin:0;"><strong>The Auralis Luxe Team</strong></p>
           <p style="margin-top:8px;">
-            <a href="https://auralisluxe.vercel.com" style="color:#e4a1b2; text-decoration:none;">auralisluxe.vercel.com</a>
+            <a href="https://auralisluxe.vercel.com" style="color:#91203d; text-decoration:none;">auralisluxe.vercel.com</a>
           </p>
         </div>
       </div>
@@ -336,7 +336,7 @@ export const inviteAdmin = async (req, res) => {
       ON CONFLICT (email) DO UPDATE SET permissions=$3, invite_token=$4, invite_expires_at=$5, created_at=NOW()
     `, [name, email, permissions || [], token, expires]);
 
-    const inviteLink = `${process.env.FRONTEND_URL || 'http://localhost:4200'}/admin/invite?token=${token}`;
+    const inviteLink = `${process.env.FRONTEND_URL || 'http://localhost:4200'}/registration?token=${token}`;
 
     await sendEmail(email, 'Auralis Luxe — Admin Invite', `
       <p>Hi ${name},</p>

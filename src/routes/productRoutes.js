@@ -11,7 +11,9 @@ import {
   getProductBySlug,
   updateProduct,
   deleteProduct,
-  getUserDetails
+  getUserDetails,
+  uploadCategoryImage,
+  searchProducts
 } from '../controllers/productController.js';
 import { authenticate, authorizePermission } from '../middlewares/authMiddleware.js'; 
 
@@ -41,6 +43,7 @@ router.delete(
   deleteCategory
 );
 
+router.post("/upload-category-image", authenticate, authorizePermission('create_categories'), uploadCategoryImage);
 
 router.get('/', listProducts); // query: ?page=1&limit=12&sort=price_asc&q=ring&category=necklaces
 router.get('/:slug', getProductBySlug);
@@ -67,6 +70,8 @@ router.delete(
   authorizePermission('delete_products'),
   deleteProduct
 );
+
+router.get('/search', searchProducts);
 
 router.get('/user-details', authenticate, getUserDetails);
 
