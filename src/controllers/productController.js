@@ -1154,16 +1154,14 @@ export const generateProductReport = async (req, res) => {
 
     const buffer = await workbook.xlsx.writeBuffer();
 
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename=product-report-${Date.now()}.xlsx`
-    );
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
+    const fileKey = `reports/product-report-${Date.now()}.xlsx`;
+    const url = await uploadBufferToR2(fileKey, buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
 
-    return res.send(buffer);
+    return res.status(200).json({
+      message: "Product report generated successfully",
+      downloadUrl: url,
+      totalProducts: products.length,
+    });
   } catch (error) {
     console.error("Error generating product report:", error);
     res.status(500).json({ message: "Internal server error" });
